@@ -1,27 +1,39 @@
-# main.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
 import time
+import json
+from datetime import datetime
 from functools import lru_cache
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from flask import Flask, jsonify, request, render_template_string
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ------------------------------------------------------------
+# Meta / Nav
+# ------------------------------------------------------------
 
 APP_META = {
     "service_name_slug": "data-sources",
-    "page_title": "OGC Datenquellen Explorer",
-    "page_h1": "OGC Datenquellen",
+    "page_title": "WMS / WFS Information Tool",
+    "page_h1": "WMS / WFS Information Tool",
     "page_subtitle": "Layer- und FeatureType-Übersicht für ausgewählte WMS/WFS-Dienste.",
 }
 
+LANDING_URL = os.environ.get("LANDING_URL", "https://data-tales.dev/")
 
 SERVICES_NAV = [
     ("PLZ → Koordinaten", "https://plz.data-tales.dev/"),
     ("OSM Baumbestand", "https://tree-locator.data-tales.dev/"),
 ]
+
+# ------------------------------------------------------------
+# OGC Services
+# ------------------------------------------------------------
 
 OGC_SERVICES = {
     "dwd_wfs": {
@@ -245,9 +257,21 @@ OGC_SERVICES = {
     },
 }
 
+# ------------------------------------------------------------
+# Runtime / Config
+# ------------------------------------------------------------
 
-DEFAULT_TIMEOUT = (3.05, 18)  # (connect, read)
-MAX_URL_LEN = 400
+MAX_URL_LEN = int(os.environ.get("MAX_URL_LEN", "400"))
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "900"))  # 15 min
+UI_SOFT_LIMIT = int(os.environ.get("UI_SOFT_LIMIT", "2000"))         # max rows rendered in HTML
+MAX_XML_BYTES = int(os.environ.get("MAX_XML_BYTES", "8000000"))      # safety limit (8 MB)
+
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "3.05"))
+READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "18"))
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+HTTP_RETRIES = int(os.environ.get("HTTP_RETRIES", "2"))
+HTTP_BACKOFF = float(os.environ.get("HTTP_BACKOFF", "0.3"))
 
 
 def _ua() -> str:
@@ -257,6 +281,25 @@ def _ua() -> str:
     )
 
 
+# requests.Session + retries
+SESSION = requests.Session()
+_retry = Retry(
+    total=HTTP_RETRIES,
+    read=HTTP_RETRIES,
+    connect=HTTP_RETRIES,
+    backoff_factor=HTTP_BACKOFF,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "HEAD"]),
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=20, pool_maxsize=50)
+SESSION.mount("https://", _adapter)
+
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
 def _build_url(base_url: str, updates: dict) -> str:
     if not base_url or len(base_url) > MAX_URL_LEN:
         raise ValueError("Ungültige Service-URL.")
@@ -265,9 +308,10 @@ def _build_url(base_url: str, updates: dict) -> str:
     if parts.scheme.lower() != "https":
         raise ValueError("Nur https:// URLs sind erlaubt.")
 
-    q = dict((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True))
+    # Case-insensitive normalize for deterministic query output
+    q = {k.lower(): v for k, v in parse_qsl(parts.query, keep_blank_values=True)}
     for k, v in updates.items():
-        q[k] = v
+        q[str(k).lower()] = str(v)
 
     query = urlencode(q, doseq=True)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
@@ -311,15 +355,58 @@ def _find_all(elem, local_name: str):
             yield e
 
 
+def _split_qname(name: str) -> tuple[str, str]:
+    if not name:
+        return "", ""
+    if ":" in name:
+        p, rest = name.split(":", 1)
+        return p, rest
+    return "", name
+
+
+def _bbox_to_str(b: dict | None) -> str:
+    if not b:
+        return ""
+    keys = ("minx", "miny", "maxx", "maxy")
+    if all(k in b for k in keys):
+        return f"{b.get('minx')},{b.get('miny')},{b.get('maxx')},{b.get('maxy')}"
+    return ""
+
+
+def _sanitize_error(msg: str) -> str:
+    msg = (msg or "").strip()
+    if not msg:
+        return "Unbekannter Fehler."
+    if len(msg) > 280:
+        msg = msg[:280] + "…"
+    return msg
+
+
 def _fetch_xml(url: str) -> bytes:
-    r = requests.get(
+    r = SESSION.get(
         url,
         headers={"User-Agent": _ua(), "Accept": "application/xml,text/xml,*/*;q=0.9"},
         timeout=DEFAULT_TIMEOUT,
+        stream=True,
     )
+    # retries may return a non-2xx without raising; enforce here
     r.raise_for_status()
-    return r.content
 
+    chunks = []
+    size = 0
+    for chunk in r.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_XML_BYTES:
+            raise ValueError("Capabilities-Dokument ist zu groß (Limit überschritten).")
+    return b"".join(chunks)
+
+
+# ------------------------------------------------------------
+# Parsing
+# ------------------------------------------------------------
 
 def _parse_wms(xml_bytes: bytes) -> tuple[list[dict], str | None]:
     import xml.etree.ElementTree as ET
@@ -335,9 +422,64 @@ def _parse_wms(xml_bytes: bytes) -> tuple[list[dict], str | None]:
 
     items: list[dict] = []
 
-    def walk(layer_elem, inherited_title: str | None = None):
+    def parse_wgs84_bbox(layer_elem) -> dict | None:
+        # WMS 1.3.0: <WGS84BoundingBox><LowerCorner>..</LowerCorner><UpperCorner>..</UpperCorner>
+        wgs = None
+        for bb in _iter_children(layer_elem, "WGS84BoundingBox"):
+            wgs = bb
+            break
+        if wgs is not None:
+            lower = _child_text(wgs, "LowerCorner")
+            upper = _child_text(wgs, "UpperCorner")
+            if lower and upper:
+                try:
+                    lx, ly = [float(x) for x in lower.split()]
+                    ux, uy = [float(x) for x in upper.split()]
+                    return {"minx": lx, "miny": ly, "maxx": ux, "maxy": uy, "crs": "EPSG:4326"}
+                except Exception:
+                    return None
+
+        # Older: <LatLonBoundingBox minx=".." miny=".." maxx=".." maxy=".."/>
+        for bb in layer_elem.iter():
+            if _local(bb.tag) == "LatLonBoundingBox":
+                try:
+                    return {
+                        "minx": float(bb.attrib.get("minx", "")),
+                        "miny": float(bb.attrib.get("miny", "")),
+                        "maxx": float(bb.attrib.get("maxx", "")),
+                        "maxy": float(bb.attrib.get("maxy", "")),
+                        "crs": "EPSG:4326",
+                    }
+                except Exception:
+                    return None
+        return None
+
+    def collect_crs(layer_elem) -> list[str]:
+        vals = []
+        for c in list(layer_elem):
+            ln = _local(c.tag)
+            if ln in ("CRS", "SRS"):
+                t = (c.text or "").strip()
+                if t:
+                    vals.append(t)
+        # de-dup, stable
+        seen = set()
+        out = []
+        for v in vals:
+            if v not in seen:
+                out.append(v)
+                seen.add(v)
+        return out
+
+    def walk(layer_elem, inherited_title: str | None = None, inherited_crs: list[str] | None = None):
         name = _child_text(layer_elem, "Name")
         title = _child_text(layer_elem, "Title") or inherited_title
+        abstract = _child_text(layer_elem, "Abstract") or ""
+        queryable = layer_elem.attrib.get("queryable") or ""
+
+        crs_here = collect_crs(layer_elem)
+        crs = crs_here if crs_here else (inherited_crs or [])
+        bbox = parse_wgs84_bbox(layer_elem)
 
         styles = []
         for s in _iter_children(layer_elem, "Style"):
@@ -347,30 +489,76 @@ def _parse_wms(xml_bytes: bytes) -> tuple[list[dict], str | None]:
                 styles.append({"name": s_name, "title": s_title})
 
         if name:
+            prefix, localname = _split_qname(name)
             items.append(
                 {
                     "type": "wms_layer",
                     "name": name,
+                    "prefix": prefix,
+                    "local_name": localname,
                     "title": title or "",
+                    "abstract": abstract,
+                    "queryable": queryable,
+                    "crs": crs,
+                    "bbox_wgs84": bbox,
                     "styles": styles,
                 }
             )
 
         for child_layer in _iter_children(layer_elem, "Layer"):
-            walk(child_layer, title)
+            walk(child_layer, title, crs)
 
     if top_layer is not None:
-        walk(top_layer, None)
+        walk(top_layer, None, [])
 
     version = root.attrib.get("version") or root.attrib.get("Version")
     return items, version
 
 
-def _parse_wfs(xml_bytes: bytes) -> tuple[list[dict], str | None]:
+def _parse_wfs(xml_bytes: bytes) -> tuple[list[dict], str | None, list[str]]:
     import xml.etree.ElementTree as ET
 
     root = ET.fromstring(xml_bytes)
     version = root.attrib.get("version") or root.attrib.get("Version")
+
+    # Output formats from OperationsMetadata/GetFeature
+    output_formats: list[str] = []
+    ops = _find_first(root, "OperationsMetadata")
+    if ops is not None:
+        for op in _find_all(ops, "Operation"):
+            if (op.attrib.get("name") or "").lower() == "getfeature":
+                for p in _find_all(op, "Parameter"):
+                    if (p.attrib.get("name") or "").lower() == "outputformat":
+                        for v in _find_all(p, "Value"):
+                            t = (v.text or "").strip()
+                            if t:
+                                output_formats.append(t)
+    # de-dup stable
+    seen = set()
+    of = []
+    for x in output_formats:
+        if x not in seen:
+            of.append(x)
+            seen.add(x)
+    output_formats = of
+
+    def parse_wgs84_bbox(ft_elem) -> dict | None:
+        # WFS 2.0: <WGS84BoundingBox><LowerCorner>..</LowerCorner>...
+        wgs = None
+        for bb in _iter_children(ft_elem, "WGS84BoundingBox"):
+            wgs = bb
+            break
+        if wgs is not None:
+            lower = _child_text(wgs, "LowerCorner")
+            upper = _child_text(wgs, "UpperCorner")
+            if lower and upper:
+                try:
+                    lx, ly = [float(x) for x in lower.split()]
+                    ux, uy = [float(x) for x in upper.split()]
+                    return {"minx": lx, "miny": ly, "maxx": ux, "maxy": uy, "crs": "EPSG:4326"}
+                except Exception:
+                    return None
+        return None
 
     items: list[dict] = []
     ft_list = _find_first(root, "FeatureTypeList")
@@ -382,28 +570,86 @@ def _parse_wfs(xml_bytes: bytes) -> tuple[list[dict], str | None]:
     for ft in feature_types:
         name = _child_text(ft, "Name") or ""
         title = _child_text(ft, "Title") or ""
+        abstract = _child_text(ft, "Abstract") or ""
         default_crs = _child_text(ft, "DefaultCRS") or _child_text(ft, "DefaultSRS") or ""
+        bbox = parse_wgs84_bbox(ft)
+
         if name:
+            prefix, localname = _split_qname(name)
             items.append(
                 {
                     "type": "wfs_featuretype",
                     "name": name,
+                    "prefix": prefix,
+                    "local_name": localname,
                     "title": title,
+                    "abstract": abstract,
                     "default_crs": default_crs,
+                    "bbox_wgs84": bbox,
                 }
             )
 
-    return items, version
+    return items, version, output_formats
 
 
-@lru_cache(maxsize=64)
-def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
+# ------------------------------------------------------------
+# Service groups (Optgroups + Search)
+# ------------------------------------------------------------
+
+def _group_for_service_key(key: str, svc: dict) -> str:
+    k = key.lower()
+    label = (svc.get("label") or "").lower()
+
+    if k.startswith("dwd_") or "dwd" in label:
+        return "DWD"
+    if k.startswith("cdc_") or "cdc" in label:
+        return "DWD (CDC)"
+    if k.startswith("pegel_") or "pegel" in label:
+        return "Deutschland (Pegelonline)"
+    if k.startswith(("bkg_", "bfn_", "bgr_", "uba_", "thuenen_")):
+        return "Deutschland (Bund)"
+    if k.startswith(("dlr_", "eumetsat_")):
+        return "Forschung / EO"
+    if k.startswith(("eea_", "copernicus_", "emodnet_")):
+        return "Europa"
+    if "haleconnect" in label or "haleconnect" in (svc.get("url") or "").lower():
+        return "Niederlande (Haleconnect)"
+    return "Weitere"
+
+def _services_grouped() -> list[tuple[str, list[tuple[str, dict]]]]:
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    for key, svc in OGC_SERVICES.items():
+        g = _group_for_service_key(key, svc)
+        groups.setdefault(g, []).append((key, svc))
+
+    # stable sort within groups
+    for g in groups:
+        groups[g].sort(key=lambda kv: (kv[1].get("label", ""), kv[0]))
+
+    order = ["DWD", "DWD (CDC)", "Deutschland (Pegelonline)", "Deutschland (Bund)", "Forschung / EO", "Europa", "Niederlande (Haleconnect)", "Weitere"]
+    out: list[tuple[str, list[tuple[str, dict]]]] = []
+    for g in order:
+        if g in groups:
+            out.append((g, groups[g]))
+    # any remaining
+    for g in sorted(set(groups.keys()) - set(order)):
+        out.append((g, groups[g]))
+    return out
+
+
+# ------------------------------------------------------------
+# Fetch + Cache
+# ------------------------------------------------------------
+
+def _get_service_data_impl(service_key: str) -> dict:
     svc = OGC_SERVICES.get(service_key)
     if not svc:
         raise ValueError("Unbekannter Service.")
 
     kind = svc["kind"]
     base_url = svc["url"]
+
+    started = time.perf_counter()
 
     if kind == "wms":
         versions = ["1.3.0", "1.1.1", ""]
@@ -420,6 +666,8 @@ def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
                 )
                 xml_bytes = _fetch_xml(cap_url)
                 items, parsed_version = _parse_wms(xml_bytes)
+
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
                 return {
                     "ok": True,
                     "service": {
@@ -434,8 +682,9 @@ def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
                         "items": len(items),
                         "styles": sum(len(it.get("styles", [])) for it in items),
                     },
-                    "items": sorted(items, key=lambda x: x.get("name", "")),
+                    "items": sorted(items, key=lambda x: (x.get("prefix", ""), x.get("local_name", ""), x.get("name", ""))),
                     "fetched_at": int(time.time()),
+                    "fetch_ms": elapsed_ms,
                 }
             except Exception as e:
                 last_err = e
@@ -456,7 +705,9 @@ def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
                     },
                 )
                 xml_bytes = _fetch_xml(cap_url)
-                items, parsed_version = _parse_wfs(xml_bytes)
+                items, parsed_version, output_formats = _parse_wfs(xml_bytes)
+
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
                 return {
                     "ok": True,
                     "service": {
@@ -466,12 +717,14 @@ def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
                         "url": base_url,
                         "capabilities_url": cap_url,
                         "version": parsed_version or (v or None),
+                        "output_formats": output_formats,
                     },
                     "counts": {
                         "items": len(items),
                     },
-                    "items": sorted(items, key=lambda x: x.get("name", "")),
+                    "items": sorted(items, key=lambda x: (x.get("prefix", ""), x.get("local_name", ""), x.get("name", ""))),
                     "fetched_at": int(time.time()),
+                    "fetch_ms": elapsed_ms,
                 }
             except Exception as e:
                 last_err = e
@@ -481,33 +734,42 @@ def _get_service_data_cached(service_key: str, cache_token: int) -> dict:
     raise ValueError("Unbekannter Service-Typ.")
 
 
+@lru_cache(maxsize=64)
+def _get_service_data_cached(service_key: str, bucket: int) -> dict:
+    # bucket is only there to make TTL cache keys change over time
+    _ = bucket
+    return _get_service_data_impl(service_key)
+
+
 def get_service_data(service_key: str, refresh: int) -> dict:
     if service_key not in OGC_SERVICES:
         raise ValueError("Bitte wähle einen gültigen Service aus.")
     refresh = 1 if refresh == 1 else 0
-    cache_token = int(time.time()) if refresh else 0
-    return _get_service_data_cached(service_key, cache_token)
 
+    if refresh:
+        # bypass cache completely
+        return _get_service_data_impl(service_key)
+
+    bucket = int(time.time()) // max(CACHE_TTL_SECONDS, 1)
+    return _get_service_data_cached(service_key, bucket)
+
+
+# ------------------------------------------------------------
+# UI helpers
+# ------------------------------------------------------------
 
 def _nav_links_html() -> str:
     service_links = [(n, u) for (n, u) in SERVICES_NAV if isinstance(u, str) and u.startswith("https://")]
     head = service_links[:6]
-    rest = service_links[6:]
-
     out = []
     for name, url in head:
         out.append(f'<a href="{url}">{name}</a>')
     return "\n".join(out)
 
 
-def _sanitize_error(msg: str) -> str:
-    msg = (msg or "").strip()
-    if not msg:
-        return "Unbekannter Fehler."
-    if len(msg) > 280:
-        msg = msg[:280] + "…"
-    return msg
-
+# ------------------------------------------------------------
+# HTML
+# ------------------------------------------------------------
 
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="de">
@@ -600,7 +862,46 @@ body{
 .nav a:hover{color:var(--text)}
 .header-actions{display:flex; gap:10px; align-items:center}
 .header-actions .btn{ font-size: 18px; }
+.header-note{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:8px 10px;
+  border-radius:12px;
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.04);
+  color: var(--muted);
+  font-weight: 750;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
 
+[data-theme="light"] .header-note{
+  background: rgba(17,24,39,.03);
+}
+
+.header-note__label{
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  font-weight: 900;
+  color: var(--muted);
+}
+
+.header-note__mail{
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 850;
+}
+
+.header-note__mail:hover{
+  text-decoration: underline;
+}
+
+/* Mobile: Label ausblenden, nur Mail zeigen */
+@media (max-width: 720px){
+  .header-note__label{ display:none; }
+}
 .btn{
   display:inline-flex; align-items:center; justify-content:center;
   gap:8px;
@@ -652,7 +953,7 @@ h2{margin:0; font-size:26px}
 .form-row{display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin:16px 0 12px}
 .field{flex:1; min-width:260px}
 .field label{display:block; font-weight:800; font-size:12px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); margin:0 0 8px}
-.field select{
+.field select, .field input[type="text"]{
   width:100%;
   padding:12px 14px;
   border-radius:12px;
@@ -661,9 +962,41 @@ h2{margin:0; font-size:26px}
   color: var(--text);
   font-weight:650;
 }
-[data-theme="light"] .field select{ background: rgba(17,24,39,.03); }
-.field select:focus{ outline:2px solid var(--focus); outline-offset:2px }
+[data-theme="light"] .field select,
+[data-theme="light"] .field input[type="text"]{ background: rgba(17,24,39,.03); }
+.field select:focus, .field input[type="text"]:focus{ outline:2px solid var(--focus); outline-offset:2px }
 .field option{ background: var(--bg2, #ffffff); color: var(--text, #111827); }
+
+/* Select-Liste konsistent einfärben (Optionen) */
+.field select option{
+  background: var(--bg2, #0f172a);
+  color: var(--text);
+}
+
+/* Optgroup ist in Chromium kaum stylbar – daher: Gruppen als disabled <option> */
+.field select option.optgroup-head{
+  background: rgba(255,255,255,.07);
+  color: var(--muted);
+  font-weight: 900;
+  letter-spacing: .10em;
+  text-transform: uppercase;
+}
+
+/* disabled Optionen werden sonst oft “ausgegraut” – hier bewusst lesbar halten */
+.field select option.optgroup-head:disabled{
+  opacity: 1;
+}
+
+/* Einrückung für normale Optionen (funktioniert je nach Browser; harmless fallback) */
+.field select option.optitem{
+  padding-left: 14px;
+}
+
+/* Light Theme: Header leicht abgesetzt */
+[data-theme="light"] .field select option.optgroup-head{
+  background: rgba(17,24,39,.06);
+}
+
 
 .inline{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
 .inline .checkbox{
@@ -681,19 +1014,38 @@ h2{margin:0; font-size:26px}
 .table-wrap{overflow:auto; border-radius: var(--radius); border:1px solid var(--border)}
 .table-wrap--vh{
   max-height: 79vh;
-  overflow: auto;          /* du hast schon overflow:auto, kann so bleiben */
+  overflow: auto;
   -webkit-overflow-scrolling: touch;
 }
-.table{width:100%; border-collapse: collapse; min-width: 720px}
+.table{width:100%; border-collapse: collapse; min-width: 860px}
 .table thead th{
   position: sticky;
   top: 0;
   background: var(--card);
   z-index: 1;
 }
-.table th, .table td{ text-align:left; padding:12px 14px; border-bottom:1px solid var(--border); vertical-align:top }
-.table th{ color: var(--muted); font-weight:900; font-size:12px; letter-spacing:.07em; text-transform:uppercase }
+.table th, .table td{
+  text-align:left;
+  padding:12px 14px;
+  border-bottom:1px solid var(--border);
+  vertical-align:top;
+  overflow-wrap:anywhere; /* E) */
+}
+.table th{
+  color: var(--muted);
+  font-weight:900;
+  font-size:12px;
+  letter-spacing:.07em;
+  text-transform:uppercase;
+  user-select:none;
+}
+.table td:nth-child(3){ max-width: 520px; } /* E) */
+.table td:nth-child(4){ max-width: 320px; } /* E) */
 .table tr:last-child td{border-bottom:none}
+.table tbody tr.data-row{ cursor:pointer; }
+.table tbody tr.data-row:hover{ background: rgba(255,255,255,.03); }
+[data-theme="light"] .table tbody tr.data-row:hover{ background: rgba(17,24,39,.03); }
+
 .small{font-size:12px; color: var(--muted); font-weight:650}
 
 .kv{display:flex; gap:14px; flex-wrap:wrap; margin-top:10px}
@@ -731,6 +1083,125 @@ h2{margin:0; font-size:26px}
   background: rgba(255,255,255,.03);
 }
 [data-theme="light"] .badge{ background: rgba(17,24,39,.02); }
+
+.badge-mini{ padding:4px 8px; font-size:11px; font-weight:900; letter-spacing:.02em; }
+
+.thbtn{
+  all:unset;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  color: var(--muted);
+}
+.thbtn:hover{ color: var(--text); }
+.sort-ind{ opacity:.85; font-weight:900; }
+
+.actions{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.iconbtn{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.03);
+  color: var(--text);
+  border-radius:10px;
+  padding:8px 10px;
+  font-weight:850;
+  cursor:pointer;
+}
+[data-theme="light"] .iconbtn{ background: rgba(17,24,39,.02); }
+.iconbtn:hover{ transform: translateY(-1px); }
+.iconbtn:active{ transform:none; }
+.iconbtn:focus{ outline:2px solid var(--focus); outline-offset:2px; }
+
+.hl{
+  background: rgba(110,168,254,.28);
+  border:1px solid rgba(110,168,254,.22);
+  padding:0 2px;
+  border-radius:6px;
+}
+
+.notice{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.03);
+  padding:12px 14px;
+  border-radius: 12px;
+  margin-top: 14px;
+}
+[data-theme="light"] .notice{ background: rgba(17,24,39,.02); }
+
+.group-row td{
+  background: rgba(255,255,255,.02);
+  color: var(--muted);
+  font-weight:900;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+}
+[data-theme="light"] .group-row td{ background: rgba(17,24,39,.02); }
+
+.modal-backdrop{
+  position:fixed;
+  inset:0;
+  background: rgba(0,0,0,.45);
+  backdrop-filter: blur(6px);
+  display:none;
+  align-items:flex-start;
+  justify-content:center;
+  padding: 22px;
+  z-index: 50;
+}
+.modal-backdrop[open]{ display:flex; }
+.modal-card{
+  width:min(920px, 100%);
+  margin-top: 40px;
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg2);
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+.modal-head{
+  display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;
+  border-bottom:1px solid var(--border);
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+}
+.modal-title{ margin:0; font-size: 22px; }
+.modal-sub{ margin:6px 0 0; color: var(--muted); line-height: 1.5; }
+.kv2{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+.kv2 .pill{ border:1px solid var(--border); border-radius:999px; padding:8px 10px; color:var(--muted); font-weight:850; background: rgba(255,255,255,.03); }
+[data-theme="light"] .kv2 .pill{ background: rgba(17,24,39,.02); }
+.codebox{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.03);
+  border-radius: 12px;
+  padding: 12px;
+  overflow:auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+[data-theme="light"] .codebox{ background: rgba(17,24,39,.02); }
+
+.toast{
+  position:fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display:none;
+  border:1px solid var(--border);
+  background: rgba(17,26,46,.92);
+  color: var(--text);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+  max-width: 520px;
+}
+[data-theme="light"] .toast{ background: rgba(255,255,255,.92); }
+.toast[open]{ display:block; }
   </style>
 </head>
 
@@ -749,6 +1220,11 @@ h2{margin:0; font-size:26px}
       </nav>
 
       <div class="header-actions">
+        <div class="header-note" aria-label="Feedback Kontakt">
+          <span class="header-note__label">Änderung / Kritik:</span>
+          <a class="header-note__mail" href="mailto:infos@data-tales.dev">infos@data-tales.dev</a>
+        </div>
+
         <a class="btn btn-primary" href="{{ landing_url }}#contact">Kontakt</a>
         <button class="btn btn-ghost" id="themeToggle" type="button" aria-label="Theme umschalten">
           <span aria-hidden="true" id="themeIcon">☾</span>
@@ -771,14 +1247,24 @@ h2{margin:0; font-size:26px}
         <form method="GET" action="/" novalidate>
           <div class="form-row">
             <div class="field">
+              <label for="serviceSearch">Service suchen</label>
+              <input id="serviceSearch" type="text" placeholder="z. B. DWD, BKG, Copernicus …" autocomplete="off" />
+            </div>
+
+            <div class="field">
               <label for="service">Service</label>
               <select id="service" name="service" required>
                 <option value="" {% if not selected %}selected{% endif %}>Bitte wählen…</option>
-                {% for key, svcopt in ogc_services.items() %}
-                  <option value="{{ key }}" {% if selected == key %}selected{% endif %}>
+
+                {% for group_label, entries in service_groups %}
+                <option class="optgroup-head" disabled>— {{ group_label }} —</option>
+                {% for key, svcopt in entries %}
+                    <option class="optitem" value="{{ key }}" {% if selected == key %}selected{% endif %}>
                     {{ svcopt.label }}
-                  </option>
+                    </option>
                 {% endfor %}
+                {% endfor %}
+
               </select>
             </div>
 
@@ -787,6 +1273,12 @@ h2{margin:0; font-size:26px}
                 <input type="checkbox" id="refresh" name="refresh" value="1" {% if refresh == 1 %}checked{% endif %} />
                 Cache umgehen (refresh=1)
               </label>
+
+              <label class="checkbox" for="groupByPrefix">
+                <input type="checkbox" id="groupByPrefix" />
+                Nach Prefix gruppieren
+              </label>
+
               <button class="btn btn-primary" type="submit">Abrufen</button>
             </div>
           </div>
@@ -825,44 +1317,92 @@ h2{margin:0; font-size:26px}
             {% if svc.version %}
               <span class="pill">Version: <strong>{{ svc.version }}</strong></span>
             {% endif %}
-            <span class="pill">Fetched: <strong>{{ fetched_at }}</strong></span>
+            <span class="pill">Fetched: <strong>{{ fetched_at_dt or "—" }}</strong>{% if fetched_in_s %} <span class="small">({{ fetched_in_s }}s)</span>{% endif %}</span>
           </div>
 
+          {% if ui_truncated %}
+            <div class="notice">
+              <strong>Hinweis:</strong> Im UI werden aus Performance-Gründen nur <strong>{{ ui_limit }}</strong> von <strong>{{ counts_items }}</strong> Items gerendert.
+              Nutze Filter/Sortierung oder exportiere via <strong>JSON (/api)</strong>.
+            </div>
+          {% endif %}
+
           <div class="search">
-            <input id="tableFilter" type="text" placeholder="Tabelle filtern (Name, Titel, Styles) …" autocomplete="off" />
+            <input id="tableFilter" type="text" placeholder="Tabelle filtern (Name, Titel, Prefix) …" autocomplete="off" />
+          </div>
+
+          <div class="inline" style="margin-top: 10px; justify-content:space-between;">
+            <div class="small" id="filterStats">—</div>
+            <button class="iconbtn" id="clearFilter" type="button">Filter löschen</button>
           </div>
 
           <div class="table-wrap table-wrap--vh" style="margin-top: 14px;">
-            <table class="table" id="resultTable">
+            <table class="table" id="resultTable"
+              data-svc-kind="{{ svc.kind }}"
+              data-svc-url="{{ svc.url }}"
+              data-svc-version="{{ svc.version or '' }}"
+              data-svc-cap-url="{{ svc.capabilities_url }}"
+              data-svc-output-formats='{{ (svc.output_formats or [])|tojson }}'>
               <thead>
                 <tr>
-                  <th>Typ</th>
-                  <th>Name</th>
-                  <th>Titel</th>
-                  <th>Details</th>
+                  <th><button class="thbtn" type="button" data-sort="type">Typ <span class="sort-ind" aria-hidden="true"></span></button></th>
+                  <th><button class="thbtn" type="button" data-sort="prefix">Prefix <span class="sort-ind" aria-hidden="true"></span></button></th>
+                  <th><button class="thbtn" type="button" data-sort="name">Name <span class="sort-ind" aria-hidden="true"></span></button></th>
+                  <th><button class="thbtn" type="button" data-sort="title">Titel <span class="sort-ind" aria-hidden="true"></span></button></th>
+                  <th><button class="thbtn" type="button" data-sort="details">Details <span class="sort-ind" aria-hidden="true"></span></button></th>
+                  <th>Aktionen</th>
                 </tr>
               </thead>
-              <tbody>
-                {% for it in rows %}
-                  <tr>
-                    <td>{% if it.type == "wms_layer" %}WMS{% else %}WFS{% endif %}</td>
-                    <td><strong>{{ it.name }}</strong></td>
-                    <td>{{ it.title }}</td>
+              <tbody id="tbody">
+                {% for it in rows_ui %}
+                  <tr class="data-row"
+                      data-row="1"
+                      data-type="{{ it.type }}"
+                      data-name="{{ it.name }}"
+                      data-prefix="{{ it.prefix or '' }}"
+                      data-local-name="{{ it.local_name or it.name }}"
+                      data-title="{{ it.title or '' }}"
+                      data-abstract="{{ it.abstract or '' }}"
+                      data-queryable="{{ it.queryable or '' }}"
+                      data-default-crs="{{ it.default_crs or '' }}"
+                      data-crs='{{ (it.crs or [])|tojson }}'
+                      data-bbox='{{ (it.bbox_wgs84 or {})|tojson }}'
+                      data-styles='{{ (it.styles or [])|tojson }}'>
+                    <td class="small">{% if it.type == "wms_layer" %}WMS{% else %}WFS{% endif %}</td>
+                    <td class="small">
+                      {% if it.prefix %}
+                        <span class="badge badge-mini">{{ it.prefix }}</span>
+                      {% else %}
+                        —
+                      {% endif %}
+                    </td>
+                    <td>
+                      <span class="nameLocal"><strong>{{ it.local_name or it.name }}</strong></span>
+                      <span class="sr-only nameFull">{{ it.name }}</span>
+                    </td>
+                    <td><span class="titleText">{{ it.title }}</span></td>
                     <td class="small">
                       {% if it.type == "wms_layer" %}
                         Styles: {{ (it.styles|length) if it.styles is defined else 0 }}
-                        {% if it.styles and (it.styles|length) > 0 %}
-                          <br/>
-                          {% for s in it.styles[:3] %}
-                            <span class="badge">{{ s.name }}</span>
-                          {% endfor %}
-                          {% if (it.styles|length) > 3 %}
-                            <span class="badge">+{{ (it.styles|length) - 3 }}</span>
-                          {% endif %}
+                        {% if it.crs and (it.crs|length) > 0 %}
+                          <br/>CRS: {{ it.crs[0] }}{% if (it.crs|length) > 1 %} <span class="badge">+{{ (it.crs|length)-1 }}</span>{% endif %}
+                        {% endif %}
+                        {% if it.bbox_wgs84 %}
+                          <br/>BBOX: {{ it.bbox_wgs84.minx }},{{ it.bbox_wgs84.miny }},{{ it.bbox_wgs84.maxx }},{{ it.bbox_wgs84.maxy }}
                         {% endif %}
                       {% else %}
-                        {% if it.default_crs %}CRS: {{ it.default_crs }}{% else %}—{% endif %}
+                        {% if it.default_crs %}CRS: {{ it.default_crs }}{% else %}CRS: —{% endif %}
+                        {% if it.bbox_wgs84 %}
+                          <br/>BBOX: {{ it.bbox_wgs84.minx }},{{ it.bbox_wgs84.miny }},{{ it.bbox_wgs84.maxx }},{{ it.bbox_wgs84.maxy }}
+                        {% endif %}
                       {% endif %}
+                    </td>
+                    <td>
+                      <div class="actions">
+                        <button class="iconbtn act-copy" type="button" title="Name kopieren">Copy</button>
+                        <button class="iconbtn act-example" type="button" title="Beispiel-Request">Example</button>
+                        <button class="iconbtn act-details" type="button" title="Details">Details</button>
+                      </div>
                     </td>
                   </tr>
                 {% endfor %}
@@ -871,12 +1411,52 @@ h2{margin:0; font-size:26px}
           </div>
 
           <p class="small" style="margin-top: 12px;">
-            Hinweis: Die Tabelle wird clientseitig gefiltert; die Rohdaten kommen aus dem jeweiligen Capabilities-Dokument.
+            Hinweis: Filter/Sortierung/Grouping laufen clientseitig. Rohdaten stammen aus dem Capabilities-Dokument.
           </p>
         </div>
       {% endif %}
     </section>
   </main>
+
+  <!-- Modal -->
+  <div class="modal-backdrop" id="detailBackdrop" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h3 class="modal-title" id="detailTitle">Details</h3>
+          <p class="modal-sub" id="detailSub">—</p>
+          <div class="kv2" id="detailPills"></div>
+        </div>
+        <div class="inline">
+          <button class="iconbtn" id="modalCopyName" type="button">Name kopieren</button>
+          <button class="iconbtn" id="modalCopyCap" type="button">Capabilities kopieren</button>
+          <button class="iconbtn" id="modalClose" type="button">Schließen</button>
+        </div>
+      </div>
+
+      <div class="small" style="margin-bottom:10px;">Beschreibung</div>
+      <div class="codebox" id="detailAbstract">—</div>
+
+      <div class="section-head" style="margin-top:16px; margin-bottom:10px;">
+        <h2 style="font-size:18px;">Requests</h2>
+      </div>
+
+      <div class="small" style="margin-bottom:6px;">Beispiel</div>
+      <div class="codebox" id="detailExample">—</div>
+      <div class="inline" style="margin-top:10px;">
+        <button class="iconbtn" id="modalCopyExample" type="button">Example kopieren</button>
+        <a class="iconbtn" id="modalOpenExample" href="#" target="_blank" rel="noreferrer">Example öffnen</a>
+      </div>
+
+      <div class="section-head" style="margin-top:16px; margin-bottom:10px;">
+        <h2 style="font-size:18px;">Details</h2>
+      </div>
+      <div class="codebox" id="detailJson">—</div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script>
   // Theme toggle (Landing-kompatibel)
@@ -906,26 +1486,449 @@ h2{margin:0; font-size:26px}
     });
   })();
 
-  // Table filter
+  // Service search -> filter select options
+  (function() {
+    const input = document.getElementById('serviceSearch');
+    const sel = document.getElementById('service');
+    if (!input || !sel) return;
+
+    function applyFilter() {
+      const q = (input.value || '').toLowerCase().trim();
+      const groups = sel.querySelectorAll('optgroup');
+      const options = sel.querySelectorAll('option');
+
+      options.forEach(opt => {
+        if (!opt.value) return;
+        const txt = (opt.textContent || '').toLowerCase();
+        opt.hidden = q && !txt.includes(q);
+      });
+
+      groups.forEach(g => {
+        const visibleChild = Array.from(g.querySelectorAll('option')).some(o => !o.hidden);
+        g.hidden = !visibleChild;
+      });
+    }
+
+    input.addEventListener('input', applyFilter);
+  })();
+
+  // Toast helper
+  (function() {
+    const el = document.getElementById('toast');
+    let t = null;
+    window.__toast = function(msg) {
+      if (!el) return;
+      el.textContent = msg;
+      el.setAttribute('open', 'open');
+      clearTimeout(t);
+      t = setTimeout(() => el.removeAttribute('open'), 2400);
+    };
+  })();
+
+  // Table controller: filter + highlight + stats + sort + prefix group + modal + copy + examples
   (function() {
     const input = document.getElementById('tableFilter');
+    const clearBtn = document.getElementById('clearFilter');
+    const stats = document.getElementById('filterStats');
+    const groupToggle = document.getElementById('groupByPrefix');
     const table = document.getElementById('resultTable');
-    if (!input || !table) return;
+    const tbody = document.getElementById('tbody');
+    if (!table || !tbody) return;
 
-    input.addEventListener('input', function() {
-      const q = (input.value || '').toLowerCase().trim();
-      const rows = table.querySelectorAll('tbody tr');
-      rows.forEach(row => {
-        const text = row.textContent.toLowerCase();
-        row.style.display = (!q || text.includes(q)) ? '' : 'none';
+    const svcKind = table.dataset.svcKind || '';
+    const svcUrl = table.dataset.svcUrl || '';
+    const svcVersion = table.dataset.svcVersion || '';
+    const capUrl = table.dataset.svcCapUrl || '';
+    let outputFormats = [];
+    try { outputFormats = JSON.parse(table.dataset.svcOutputFormats || '[]') || []; } catch(e) {}
+
+    const world3857 = "-20037508.342789244,-20037508.342789244,20037508.342789244,20037508.342789244";
+    const crs3857 = "EPSG:3857";
+
+    function mergeUrl(baseUrl, params) {
+      const u = new URL(baseUrl);
+      // delete case-insensitive duplicates for each param
+      Object.keys(params).forEach(k => {
+        const target = k.toLowerCase();
+        Array.from(u.searchParams.keys()).forEach(existing => {
+          if (existing.toLowerCase() === target && existing !== k) u.searchParams.delete(existing);
+        });
+        u.searchParams.set(k, params[k]);
+      });
+      return u.toString();
+    }
+
+    function pickOutputFormat() {
+      const lower = outputFormats.map(x => (x || '').toLowerCase());
+      const idxJson = lower.findIndex(x => x.includes("json"));
+      if (idxJson >= 0) return outputFormats[idxJson];
+      if (outputFormats.length) return outputFormats[0];
+      return "application/json";
+    }
+
+    function buildExampleForRow(rowData) {
+      if (rowData.type === "wms_layer") {
+        const is13 = (svcVersion || '').startsWith("1.3");
+        const params = {
+          service: "WMS",
+          request: "GetMap",
+          ...(svcVersion ? {version: svcVersion} : {}),
+          layers: rowData.name,
+          styles: "",
+          format: "image/png",
+          transparent: "true",
+          width: "800",
+          height: "500",
+          ...(is13 ? {crs: crs3857} : {srs: crs3857}),
+          bbox: world3857,
+        };
+        return mergeUrl(svcUrl, params);
+      }
+
+      // WFS
+      const is20 = (svcVersion || '').startsWith("2.");
+      const typeKey = is20 ? "typenames" : "typename";
+      const limitKey = is20 ? "count" : "maxFeatures";
+      const getFeature = mergeUrl(svcUrl, {
+        service: "WFS",
+        request: "GetFeature",
+        ...(svcVersion ? {version: svcVersion} : {}),
+        [typeKey]: rowData.name,
+        [limitKey]: "10",
+        outputFormat: pickOutputFormat(),
+      });
+
+      const describe = mergeUrl(svcUrl, {
+        service: "WFS",
+        request: "DescribeFeatureType",
+        ...(svcVersion ? {version: svcVersion} : {}),
+        typeName: rowData.name
+      });
+
+      return getFeature + "\n\n" + describe;
+    }
+
+    // Model rows
+    const rows = Array.from(tbody.querySelectorAll('tr[data-row="1"]')).map(tr => {
+      let crs = [];
+      let bbox = {};
+      let styles = [];
+      try { crs = JSON.parse(tr.dataset.crs || '[]') || []; } catch(e) {}
+      try { bbox = JSON.parse(tr.dataset.bbox || '{}') || {}; } catch(e) {}
+      try { styles = JSON.parse(tr.dataset.styles || '[]') || []; } catch(e) {}
+
+      const nameLocalEl = tr.querySelector('.nameLocal');
+      const titleEl = tr.querySelector('.titleText');
+      const localNameText = (tr.dataset.localName || '').trim();
+      const titleText = (tr.dataset.title || '').trim();
+
+      return {
+        tr,
+        type: tr.dataset.type || '',
+        name: tr.dataset.name || '',
+        prefix: tr.dataset.prefix || '',
+        localName: localNameText || (tr.dataset.name || ''),
+        title: titleText,
+        abstract: tr.dataset.abstract || '',
+        queryable: tr.dataset.queryable || '',
+        defaultCrs: tr.dataset.defaultCrs || '',
+        crs,
+        bbox,
+        styles,
+        nameLocalEl,
+        titleEl,
+        baseText: ((tr.dataset.type || '') + " " + (tr.dataset.prefix || '') + " " + (tr.dataset.name || '') + " " + (tr.dataset.title || '')).toLowerCase()
+      };
+    });
+
+    // Sorting state
+    let sortKey = "name";
+    let sortDir = "asc";
+
+    function setSortIndicators() {
+      table.querySelectorAll('th .sort-ind').forEach(el => el.textContent = "");
+      const btn = table.querySelector(`.thbtn[data-sort="${sortKey}"]`);
+      if (!btn) return;
+      const ind = btn.querySelector('.sort-ind');
+      if (ind) ind.textContent = sortDir === "asc" ? "▲" : "▼";
+    }
+
+    function cmp(a, b) {
+      function v(x) {
+        if (sortKey === "type") return (x.type || "");
+        if (sortKey === "prefix") return (x.prefix || "");
+        if (sortKey === "title") return (x.title || "");
+        if (sortKey === "details") return (x.type === "wms_layer" ? (x.crs[0] || "") : (x.defaultCrs || ""));
+        // name
+        return (x.localName || x.name || "");
+      }
+      const av = v(a).toLowerCase();
+      const bv = v(b).toLowerCase();
+      if (av < bv) return sortDir === "asc" ? -1 : 1;
+      if (av > bv) return sortDir === "asc" ? 1 : -1;
+      return 0;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function highlightText(text, q) {
+      if (!q) return escapeHtml(text);
+      const t = String(text);
+      const idx = t.toLowerCase().indexOf(q);
+      if (idx < 0) return escapeHtml(t);
+      const before = escapeHtml(t.slice(0, idx));
+      const mid = escapeHtml(t.slice(idx, idx + q.length));
+      const after = escapeHtml(t.slice(idx + q.length));
+      return before + '<span class="hl">' + mid + '</span>' + after;
+    }
+
+    function clearHighlights(r) {
+      if (r.nameLocalEl) r.nameLocalEl.innerHTML = "<strong>" + escapeHtml(r.localName) + "</strong>";
+      if (r.titleEl) r.titleEl.innerHTML = escapeHtml(r.title);
+    }
+
+    function applyHighlights(r, q) {
+      if (!q) { clearHighlights(r); return; }
+      if (r.nameLocalEl) r.nameLocalEl.innerHTML = "<strong>" + highlightText(r.localName, q) + "</strong>";
+      if (r.titleEl) r.titleEl.innerHTML = highlightText(r.title, q);
+    }
+
+    function removeGroupRows() {
+      Array.from(tbody.querySelectorAll('tr.group-row')).forEach(tr => tr.remove());
+    }
+
+    function insertGroupRows(visibleRowsSorted) {
+      removeGroupRows();
+      let last = null;
+      visibleRowsSorted.forEach(r => {
+        const p = (r.prefix || "—");
+        if (p !== last) {
+          const g = document.createElement('tr');
+          g.className = 'group-row';
+          const td = document.createElement('td');
+          td.colSpan = 6;
+          td.textContent = (p === "—" ? "Ohne Prefix" : p);
+          g.appendChild(td);
+          tbody.insertBefore(g, r.tr);
+          last = p;
+        }
+      });
+    }
+
+    function render() {
+      const q = (input ? input.value : '').toLowerCase().trim();
+      const group = !!(groupToggle && groupToggle.checked);
+
+      // filter + highlight + count
+      let visible = [];
+      rows.forEach(r => {
+        const hit = (!q || r.baseText.includes(q));
+        r.tr.style.display = hit ? "" : "none";
+        if (hit) visible.push(r);
+        applyHighlights(r, q);
+      });
+
+      // sort visible
+      visible.sort(cmp);
+
+      // reorder DOM: append in sorted order (keeps others in DOM but display none)
+      removeGroupRows();
+      visible.forEach(r => tbody.appendChild(r.tr));
+      // keep hidden rows at end to avoid reflow jitter
+      rows.filter(r => !visible.includes(r)).forEach(r => tbody.appendChild(r.tr));
+
+      if (group) insertGroupRows(visible);
+
+      if (stats) stats.textContent = `${visible.length} / ${rows.length} sichtbar`;
+      setSortIndicators();
+    }
+
+    // sort header clicks
+    table.querySelectorAll('.thbtn[data-sort]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const k = btn.getAttribute('data-sort');
+        if (!k) return;
+        if (sortKey === k) {
+          sortDir = (sortDir === "asc") ? "desc" : "asc";
+        } else {
+          sortKey = k;
+          sortDir = "asc";
+        }
+        render();
       });
     });
+
+    // filter input
+    if (input) input.addEventListener('input', render);
+    if (groupToggle) groupToggle.addEventListener('change', render);
+    if (clearBtn) clearBtn.addEventListener('click', () => {
+      if (input) input.value = "";
+      render();
+      input && input.focus();
+    });
+
+    // Modal logic
+    const backdrop = document.getElementById('detailBackdrop');
+    const closeBtn = document.getElementById('modalClose');
+    const copyNameBtn = document.getElementById('modalCopyName');
+    const copyCapBtn = document.getElementById('modalCopyCap');
+    const copyExampleBtn = document.getElementById('modalCopyExample');
+    const openExampleLink = document.getElementById('modalOpenExample');
+
+    const titleEl = document.getElementById('detailTitle');
+    const subEl = document.getElementById('detailSub');
+    const pillsEl = document.getElementById('detailPills');
+    const abstractEl = document.getElementById('detailAbstract');
+    const exampleEl = document.getElementById('detailExample');
+    const jsonEl = document.getElementById('detailJson');
+
+    let current = null;
+    function openModal(r) {
+      current = r;
+      if (!backdrop) return;
+      backdrop.setAttribute('open', 'open');
+
+      const kindLabel = (r.type === "wms_layer") ? "WMS Layer" : "WFS FeatureType";
+      if (titleEl) titleEl.textContent = (r.localName || r.name || "Details");
+      if (subEl) subEl.textContent = `${kindLabel} · ${r.name}`;
+
+      // pills
+      if (pillsEl) {
+        pillsEl.innerHTML = "";
+        const addPill = (txt) => {
+          const s = document.createElement('span');
+          s.className = "pill";
+          s.textContent = txt;
+          pillsEl.appendChild(s);
+        };
+        addPill(`Prefix: ${r.prefix || "—"}`);
+        if (r.type === "wms_layer") {
+          addPill(`Styles: ${(r.styles || []).length}`);
+          addPill(`CRS: ${(r.crs && r.crs.length) ? r.crs[0] : "—"}`);
+          if (r.bbox && ("minx" in r.bbox)) addPill(`BBOX: ${r.bbox.minx},${r.bbox.miny},${r.bbox.maxx},${r.bbox.maxy}`);
+          if (r.queryable) addPill(`Queryable: ${r.queryable}`);
+        } else {
+          addPill(`DefaultCRS: ${r.defaultCrs || "—"}`);
+          if (r.bbox && ("minx" in r.bbox)) addPill(`BBOX: ${r.bbox.minx},${r.bbox.miny},${r.bbox.maxx},${r.bbox.maxy}`);
+          if (outputFormats && outputFormats.length) addPill(`OutputFormats: ${outputFormats.length}`);
+        }
+      }
+
+      // abstract
+      if (abstractEl) abstractEl.textContent = (r.abstract && r.abstract.trim()) ? r.abstract.trim() : "—";
+
+      // example
+      const ex = buildExampleForRow(r);
+      if (exampleEl) exampleEl.textContent = ex;
+
+      if (openExampleLink) {
+        // for WFS example contains 2 urls; open first
+        const first = ex.split("\n")[0].trim();
+        openExampleLink.href = first || "#";
+      }
+
+      // detail json (row + service)
+      if (jsonEl) {
+        const payload = {
+          service: {
+            kind: svcKind,
+            url: svcUrl,
+            version: svcVersion,
+            capabilities_url: capUrl,
+            output_formats: outputFormats,
+          },
+          item: {
+            type: r.type,
+            name: r.name,
+            prefix: r.prefix,
+            local_name: r.localName,
+            title: r.title,
+            abstract: r.abstract,
+            queryable: r.queryable,
+            default_crs: r.defaultCrs,
+            crs: r.crs,
+            bbox_wgs84: r.bbox,
+            styles: r.styles,
+          }
+        };
+        jsonEl.textContent = JSON.stringify(payload, null, 2);
+      }
+    }
+
+    function closeModal() {
+      if (!backdrop) return;
+      backdrop.removeAttribute('open');
+      current = null;
+    }
+
+    if (closeBtn) closeBtn.addEventListener('click', closeModal);
+    if (backdrop) backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === "Escape" && backdrop && backdrop.hasAttribute('open')) closeModal();
+    });
+
+    async function copyToClipboard(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        window.__toast && window.__toast("Kopiert.");
+      } catch(e) {
+        window.__toast && window.__toast("Kopieren nicht möglich (Browser/Permission).");
+      }
+    }
+
+    if (copyNameBtn) copyNameBtn.addEventListener('click', () => current && copyToClipboard(current.name));
+    if (copyCapBtn) copyCapBtn.addEventListener('click', () => copyToClipboard(capUrl));
+    if (copyExampleBtn) copyExampleBtn.addEventListener('click', () => current && copyToClipboard(buildExampleForRow(current)));
+
+    // Row actions + row click
+    rows.forEach(r => {
+      const tr = r.tr;
+
+      // click row => details
+      tr.addEventListener('click', () => openModal(r));
+
+      // action buttons
+      const btnCopy = tr.querySelector('.act-copy');
+      const btnExample = tr.querySelector('.act-example');
+      const btnDetails = tr.querySelector('.act-details');
+
+      if (btnCopy) btnCopy.addEventListener('click', (e) => {
+        e.stopPropagation();
+        copyToClipboard(r.name);
+      });
+
+      if (btnExample) btnExample.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const ex = buildExampleForRow(r);
+        copyToClipboard(ex);
+      });
+
+      if (btnDetails) btnDetails.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openModal(r);
+      });
+    });
+
+    // Initial sort + stats
+    render();
   })();
   </script>
 </body>
 </html>
 """
 
+# ------------------------------------------------------------
+# Flask app
+# ------------------------------------------------------------
 
 app = Flask(__name__)
 
@@ -948,6 +1951,8 @@ def api():
 
     try:
         data = get_service_data(service_key, refresh)
+        # API always returns full items (no UI soft-limit)
+        data["cache"] = {"ttl_seconds": CACHE_TTL_SECONDS, "refresh_bypass": bool(refresh)}
         return jsonify(data), 200
     except ValueError as e:
         return jsonify({"ok": False, "error": _sanitize_error(str(e))}), 400
@@ -983,12 +1988,9 @@ def index():
             except Exception as e:
                 error = _sanitize_error(str(e))
 
-    ogc_services_for_select = {
-        k: {"label": v["label"], "kind": v["kind"], "url": v["url"]}
-        for k, v in OGC_SERVICES.items()
-    }
+    # Grouped services for <optgroup>
+    service_groups = _services_grouped()
 
-    # Avoid Jinja dict-key collision with .items() by passing explicit vars
     has_data = bool(data and isinstance(data, dict))
     svc = (data or {}).get("service", {}) if has_data else {}
     counts = (data or {}).get("counts", {}) if has_data else {}
@@ -996,12 +1998,35 @@ def index():
     counts_items = counts.get("items", 0) if isinstance(counts, dict) else 0
     counts_styles = counts.get("styles", None) if isinstance(counts, dict) else None
     fetched_at = (data or {}).get("fetched_at", None) if has_data else None
+    fetch_ms = (data or {}).get("fetch_ms", None) if has_data else None
+
+    fetched_at_dt = None
+    if fetched_at:
+        try:
+            fetched_at_dt = datetime.fromtimestamp(int(fetched_at)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            fetched_at_dt = None
+
+    fetched_in_s = None
+    if fetch_ms is not None:
+        try:
+            fetched_in_s = f"{(int(fetch_ms) / 1000.0):.2f}"
+        except Exception:
+            fetched_in_s = None
+
+    # UI soft-limit (HTML only)
+    ui_truncated = False
+    rows_ui = rows
+    if isinstance(rows, list) and UI_SOFT_LIMIT > 0 and len(rows) > UI_SOFT_LIMIT:
+        ui_truncated = True
+        rows_ui = rows[:UI_SOFT_LIMIT]
 
     return render_template_string(
         HTML_TEMPLATE,
         meta=APP_META,
+        landing_url=LANDING_URL,
         nav_links=_nav_links_html(),
-        ogc_services=ogc_services_for_select,
+        service_groups=service_groups,
         selected=service_key or None,
         refresh=refresh,
         error=error,
@@ -1009,11 +2034,15 @@ def index():
         svc=svc,
         counts_items=counts_items,
         counts_styles=counts_styles,
-        fetched_at=fetched_at,
-        rows=rows,
+        fetched_at_dt=fetched_at_dt,
+        fetched_in_s=fetched_in_s,
+        ui_truncated=ui_truncated,
+        ui_limit=UI_SOFT_LIMIT,
+        rows_ui=rows_ui,
     )
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
