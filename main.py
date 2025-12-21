@@ -815,136 +815,130 @@ HTML_TEMPLATE = r"""<!doctype html>
 
 *{box-sizing:border-box}
 html,body{height:100%}
-body{
-  margin:0;
-  font-family:var(--font);
-  background: radial-gradient(1200px 800px at 20% -10%, rgba(110,168,254,.25), transparent 55%),
-              radial-gradient(1000px 700px at 110% 10%, rgba(139,212,255,.20), transparent 55%),
-              linear-gradient(180deg, var(--bg), var(--bg2));
-  color:var(--text);
-}
+  body{
+    margin:0;
+    font-family:var(--font);
+    background: radial-gradient(1200px 800px at 20% -10%, rgba(110,168,254,.25), transparent 55%),
+                radial-gradient(1000px 700px at 110% 10%, rgba(139,212,255,.20), transparent 55%),
+                linear-gradient(180deg, var(--bg), var(--bg2));
+    color:var(--text);
+  }
+  .container{max-width:var(--container); margin:0 auto; padding:0 18px;}
+  .skip-link{
+    position:absolute; left:-999px; top:10px;
+    background:var(--card); color:var(--text);
+    padding:10px 12px; border-radius:10px;
+    border:1px solid var(--border);
+  }
+  .skip-link:focus{left:10px; outline:2px solid var(--focus)}
+  .site-header{
+    position:sticky; top:0; z-index:20;
+    backdrop-filter: blur(10px);
+    background: rgba(10, 14, 24, .55);
+    border-bottom:1px solid var(--border);
+  }
+  [data-theme="light"] .site-header{ background: rgba(246,247,251,.75); }
+  .header-inner{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px 0; gap:14px;
+  }
+  .brand{display:flex; align-items:center; gap:10px; text-decoration:none; color:var(--text); font-weight:700}
+  .brand-mark{
+    width:14px; height:14px; border-radius:6px;
+    background: linear-gradient(135deg, var(--primary), var(--primary2));
+    box-shadow: 0 10px 25px rgba(110,168,254,.25);
+  }
 
-.container{
-  max-width:var(--container);
-  margin:0 auto;
-  padding:0 18px;
-}
+  /* Dropdown */
+  .nav-dropdown{ position: relative; display: inline-flex; align-items: center; }
+  .nav-dropbtn{
+    background: none; border: none; padding: 0; margin: 0; font-family: inherit;
+    color: var(--muted); text-decoration: none; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 8px;
+    cursor: pointer; height: 100%;
+  }
+  .nav-dropbtn:hover{ color: var(--text); transform: none; }
+  .nav-caret{ font-size: .9em; opacity: 1; }
 
-.skip-link{
-  position:absolute; left:-999px; top:10px;
-  background:var(--card); color:var(--text);
-  padding:10px 12px; border-radius:10px;
-  border:1px solid var(--border);
-}
-.skip-link:focus{left:10px; outline:2px solid var(--focus)}
+  .nav-menu{
+    position: absolute;
+    top: calc(100% + 10px);
+    left: 0;
+    min-width: 240px;
+    padding: 10px;
+    z-index: 6000;
+    backdrop-filter: blur(10px);
+  }
 
-.site-header{
-  position:sticky; top:0; z-index:20;
-  backdrop-filter: blur(10px);
-  background: rgba(10, 14, 24, .55);
-  border-bottom:1px solid var(--border);
-}
-[data-theme="light"] .site-header{ background: rgba(246,247,251,.75); }
+  .nav-menu a{
+    display: block;
+    padding: 10px 10px;
+    border-radius: 12px;
+    text-decoration: none;
+    color: var(--text);
+    font-weight: 650;
+  }
+  .nav-menu a:hover{ background: rgba(110,168,254,.12); }
 
-.header-inner{
-  display:flex; align-items:center; justify-content:space-between;
-  padding:14px 0;
-  gap:14px;
-}
-.brand{display:flex; align-items:center; gap:10px; text-decoration:none; color:var(--text); font-weight:700}
-.brand-mark{
-  width:14px; height:14px; border-radius:6px;
-  background: linear-gradient(135deg, var(--primary), var(--primary2));
-  box-shadow: 0 10px 25px rgba(110,168,254,.25);
-}
-.nav{display:flex; gap:16px; flex-wrap:wrap}
-.nav a{color:var(--muted); text-decoration:none; font-weight:600}
-.nav a:hover{color:var(--text)}
-.header-actions{display:flex; gap:10px; align-items:center}
-.header-actions .btn{ font-size: 18px; }
-.header-note{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  padding:8px 10px;
-  border-radius:12px;
-  border:1px solid var(--border);
-  background: rgba(255,255,255,.04);
-  color: var(--muted);
-  font-weight: 750;
-  font-size: 12px;
-  line-height: 1;
-  white-space: nowrap;
-}
+  /* --- Buttons / misc --- */
+  .header-actions{display:flex; gap:10px; align-items:center}
+  .header-note{
+    display:flex; align-items:center; gap:8px;
+    padding:8px 10px;
+    border-radius:12px;
+    border:1px solid var(--border);
+    background: rgba(255,255,255,.04);
+    color: var(--muted);
+    font-weight: 750;
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  [data-theme="light"] .header-note{ background: rgba(17,24,39,.03); }
+  .header-note__label{
+    letter-spacing: .06em; text-transform: uppercase;
+    font-weight: 900; color: var(--muted);
+  }
+  .header-note__mail{
+    color: var(--text);
+    text-decoration: none;
+    font-weight: 850;
+  }
+  .header-note__mail:hover{ text-decoration: underline; }
+  @media (max-width: 720px){ .header-note__label{ display:none; } }
 
-[data-theme="light"] .header-note{
-  background: rgba(17,24,39,.03);
-}
+ 
+  .header-inner{
+    padding-left: 6px;   /* addiert sich zum container padding */
+    padding-right: 6px;
+  }
 
-.header-note__label{
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  font-weight: 900;
-  color: var(--muted);
-}
+  .btn{
+    display:inline-flex; align-items:center; justify-content:center;
+    gap:8px; padding:5px 7px;
+    border-radius:12px; border:1px solid transparent;
+    text-decoration:none; font-weight:700;
+    color:var(--text); background: transparent;
+    cursor:pointer; user-select:none;
+  }
+  .btn:focus{outline:2px solid var(--focus); outline-offset:2px}
+  .btn-primary{
+    border-color: transparent;
+    background: linear-gradient(135deg, var(--primary), var(--primary2));
+    color: #0b0f19;
+  }
+  [data-theme="light"] .btn-primary{ color:#ffffff; }
+  .btn-secondary{ background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.02); }
+  [data-theme="light"] .btn-secondary{ background: rgba(17,24,39,.04); border-color: rgba(17,24,39,.04); }
+  .btn-ghost{ background: transparent; border-color: rgba(255,255,255,.10); }
+  [data-theme="light"] .btn-ghost{ border-color: rgba(17,24,39,.12); }
+  .btn:hover{transform: translateY(-1px)}
+  .btn:active{transform:none}
+  .sr-only{
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); border:0;
+  }
 
-.header-note__mail{
-  color: var(--text);
-  text-decoration: none;
-  font-weight: 850;
-}
-
-.header-note__mail:hover{
-  text-decoration: underline;
-}
-
-/* Mobile: Label ausblenden, nur Mail zeigen */
-@media (max-width: 720px){
-  .header-note__label{ display:none; }
-}
-.btn{
-  display:inline-flex; align-items:center; justify-content:center;
-  gap:8px;
-  padding:10px 14px;
-  border-radius:12px;
-  border:1px solid transparent;
-  text-decoration:none;
-  font-weight:700;
-  color:var(--text);
-  background: transparent;
-  cursor:pointer;
-}
-.btn:focus{outline:2px solid var(--focus); outline-offset:2px}
-.btn-primary{
-  border-color: transparent;
-  background: linear-gradient(135deg, var(--primary), var(--primary2));
-  color: #0b0f19;
-}
-[data-theme="light"] .btn-primary{ color:#ffffff; }
-.btn-secondary{ background: rgba(255,255,255,.06); }
-[data-theme="light"] .btn-secondary{ background: rgba(17,24,39,.04); }
-.btn-ghost{ background: transparent; }
-.btn:hover{transform: translateY(-1px)}
-.btn:active{transform:none}
-
-.section-head{display:flex; align-items:flex-end; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:16px}
-h1{margin:0 0 12px; font-size:42px; line-height:1.1}
-@media (max-width: 520px){ h1{font-size:34px} }
-h2{margin:0; font-size:26px}
-.muted{color:var(--muted); line-height:1.6; margin:0}
-
-.card{
-  border:1px solid var(--border);
-  border-radius: var(--radius);
-  background: rgba(255,255,255,.04);
-  padding:16px;
-  box-shadow: var(--shadow);
-}
-
-.sr-only{
-  position:absolute; width:1px; height:1px; padding:0; margin:-1px;
-  overflow:hidden; clip:rect(0,0,0,0); border:0;
-}
 
 /* minimal additions */
 .content{padding:34px 0 56px}
@@ -1209,46 +1203,48 @@ h2{margin:0; font-size:26px}
   <a class="skip-link" href="#main">Zum Inhalt springen</a>
 
   <header class="site-header">
-    <div class="container header-inner">
-      <a class="brand" href="{{ landing_url }}" aria-label="Zur Landing Page">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <span class="brand-text">data-tales.dev</span>
-      </a>
+      <div class="container header-inner">
+        <a class="brand" href="{{ landing_url }}" aria-label="Zur Landing Page">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-text">data-tales.dev</span>
+        </a>
 
-      <div class="nav-dropdown" data-dropdown>
-          <button class="btn btn-ghost nav-dropbtn"
-                  type="button"
-                  aria-haspopup="true"
-                  aria-expanded="false"
-                  aria-controls="servicesMenu">
-            Dienste <span class="nav-caret" aria-hidden="true">▾</span>
-          </button>
+        <div class="nav-dropdown" data-dropdown>
+            <button class="btn btn-ghost nav-dropbtn"
+                    type="button"
+                    aria-haspopup="true"
+                    aria-expanded="false"
+                    aria-controls="servicesMenu">
+              Dienste <span class="nav-caret" aria-hidden="true">▾</span>
+            </button>
 
-          <div id="servicesMenu" class="card nav-menu" role="menu" hidden>
-            <a role="menuitem" href="https://flybi-demo.data-tales.dev/">Flybi Dashboard Demo</a>
-            <a role="menuitem" href="https://wms-wfs-sources.data-tales.dev/">WMS/WFS Server Viewer</a>
-            <a role="menuitem" href="https://tree-locator.data-tales.dev/">Tree Locator</a>
-            <a role="menuitem" href="https://plz.data-tales.dev/">PLZ → Koordinaten</a>
-            <a role="menuitem" href="https://paw-wiki.data-tales.dev/">Paw Patrole Wiki</a>
-            <a role="menuitem" href="https://paw-quiz.data-tales.dev/">Paw Patrole Quiz</a>
-            <a role="menuitem" href="https://hp-quiz.data-tales.dev/">Harry Potter Quiz</a>
-            <a role="menuitem" href="https://worm-attack-3000.data-tales.dev/">Wurm Attacke 3000</a>
-          </div>
-      </div>
-
-      <div class="header-actions">
-        <div class="header-note" aria-label="Feedback Kontakt">
-          <span class="header-note__label">Änderung / Kritik:</span>
-          <a class="header-note__mail" href="mailto:info@data-tales.dev">info@data-tales.dev</a>
+            <div id="servicesMenu" class="card nav-menu" role="menu" hidden>
+              <a role="menuitem" href="https://flybi-demo.data-tales.dev/">Flybi Dashboard Demo</a>
+              <a role="menuitem" href="https://wms-wfs-sources.data-tales.dev/">WMS/WFS Server Viewer</a>
+              <a role="menuitem" href="https://tree-locator.data-tales.dev/">Tree Locator</a>
+              <a role="menuitem" href="https://plz.data-tales.dev/">PLZ → Koordinaten</a>
+              <a role="menuitem" href="https://paw-wiki.data-tales.dev/">Paw Wiki</a>
+              <a role="menuitem" href="https://paw-quiz.data-tales.dev/">Paw Quiz</a>
+              <a role="menuitem" href="https://wizard-quiz.data-tales.dev/">Wizard Quiz</a>
+              <a role="menuitem" href="https://worm-attack-3000.data-tales.dev/">Wurm Attacke 3000</a>
+            </div>
         </div>
 
-        
-        <button class="btn btn-ghost" id="themeToggle" type="button" aria-label="Theme umschalten">
-          <span aria-hidden="true" id="themeIcon">☾</span>
-          <span class="sr-only">Theme umschalten</span>
-        </button>
+        <div class="header-actions">
+          <div class="header-note" aria-label="Feedback Kontakt">
+            <span class="header-note__label">Änderung / Kritik:</span>
+            <a class="header-note__mail" href="mailto:info@data-tales.dev">info@data-tales.dev</a>
+          </div>
+
+          <button class="btn btn-ghost" id="themeToggle" type="button" aria-label="Theme umschalten">
+            <span aria-hidden="true" id="themeIcon">☾</span>
+            <span class="sr-only">Theme umschalten</span>
+          </button>
+        </div>
       </div>
-    </div>
+    </header>
+
+
   </header>
 
   <main id="main" class="content">
