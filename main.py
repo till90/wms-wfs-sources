@@ -350,6 +350,40 @@ OGC_SERVICES = {
         "kind": "wms",
         "url": "https://www.geoproxy.geoportal-th.de/geoproxy/services/DOP?SERVICE=WMS&REQUEST=GetCapabilities",
     },
+
+    # ---------------------------------------------------------------------
+    # Deutschland (Länder) – DOP20 (WCS)
+    # ---------------------------------------------------------------------
+    "dop20_bw_wcs": {
+        "label": "DOP20 Baden-Württemberg (WCS)",
+        "kind": "wcs",
+        "url": "https://owsproxy.lgl-bw.de/owsproxy/wcs/WCS_INSP_BW_Orthofoto_DOP20?SERVICE=WCS&REQUEST=GetCapabilities",
+    },
+    "dop20_bb_wcs": {
+        "label": "DOP20 Brandenburg (WCS)",
+        "kind": "wcs",
+        "url": "https://inspire.brandenburg.de/services/oi_dop20_wcs?REQUEST=GetCapabilities&SERVICE=WCS",
+    },
+    "dop20_he_wcs": {
+        "label": "DOP20 Hessen (WCS)",
+        "kind": "wcs",
+        "url": "https://inspire.hessen.de/raster/dop20/ows?service=WCS&request=GetCapabilities",
+    },
+    "dop20_mv_wcs": {
+        "label": "DOP20 Mecklenburg-Vorpommern (WCS)",
+        "kind": "wcs",
+        "url": "https://www.geodaten-mv.de/dienste/inspire_oi_dop_wcs?SERVICE=WCS&REQUEST=GetCapabilities",
+    },
+    "dop20_nw_wcs": {
+        "label": "DOP20 Nordrhein-Westfalen (WCS)",
+        "kind": "wcs",
+        "url": "https://www.wcs.nrw.de/geobasis/wcs_nw_dop?SERVICE=WCS&REQUEST=GetCapabilities",
+    },
+    "dop20_sl_wcs": {
+        "label": "DOP20 Saarland (WCS)",
+        "kind": "wcs",
+        "url": "https://geoportal.saarland.de/gdi-sl/inspireraster/inspirewcsoi?SERVICE=WCS&REQUEST=GetCapabilities&",
+    },
 }
 
 # ------------------------------------------------------------
@@ -687,6 +721,36 @@ def _parse_wfs(xml_bytes: bytes) -> tuple[list[dict], str | None, list[str]]:
     return items, version, output_formats
 
 
+def _parse_wcs(xml_bytes: bytes) -> tuple[list[dict], str | None, list[str]]:
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml_bytes)
+    version = root.attrib.get("version") or root.attrib.get("Version")
+
+    output_formats: list[str] = []
+    
+    items: list[dict] = []
+    for cov in _find_all(root, "CoverageSummary"):
+        name = _child_text(cov, "CoverageId") or ""
+        title = _child_text(cov, "Title") or ""
+        
+        if name:
+            items.append(
+                {
+                    "type": "wcs_coverage",
+                    "name": name,
+                    "prefix": "",
+                    "local_name": name,
+                    "title": title,
+                    "abstract": "",
+                    "default_crs": "",
+                    "bbox_wgs84": None,
+                }
+            )
+
+    return items, version, output_formats
+
+
 # ------------------------------------------------------------
 # Service groups (Optgroups + Search)
 # ------------------------------------------------------------
@@ -827,6 +891,46 @@ def _get_service_data_impl(service_key: str) -> dict:
                 last_err = e
                 continue
         raise RuntimeError(f"WFS Capabilities konnten nicht geladen werden: {str(last_err)[:220]}")
+
+    if kind == "wcs":
+        versions = ["2.0.1", "2.0.0", "1.0.0", ""]
+        last_err = None
+        for v in versions:
+            try:
+                cap_url = _build_url(
+                    base_url,
+                    {
+                        "service": "WCS",
+                        "request": "GetCapabilities",
+                        **({"version": v} if v else {}),
+                    },
+                )
+                xml_bytes = _fetch_xml(cap_url)
+                items, parsed_version, output_formats = _parse_wcs(xml_bytes)
+
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                return {
+                    "ok": True,
+                    "service": {
+                        "key": service_key,
+                        "label": svc["label"],
+                        "kind": kind,
+                        "url": base_url,
+                        "capabilities_url": cap_url,
+                        "version": parsed_version or (v or None),
+                        "output_formats": output_formats,
+                    },
+                    "counts": {
+                        "items": len(items),
+                    },
+                    "items": sorted(items, key=lambda x: (x.get("prefix", ""), x.get("local_name", ""), x.get("name", ""))),
+                    "fetched_at": int(time.time()),
+                    "fetch_ms": elapsed_ms,
+                }
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(f"WCS Capabilities konnten nicht geladen werden: {str(last_err)[:220]}")
 
     raise ValueError("Unbekannter Service-Typ.")
 
