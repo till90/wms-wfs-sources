@@ -266,6 +266,90 @@ OGC_SERVICES = {
         "kind": "wfs",
         "url": "https://ows.emodnet-bathymetry.eu/wfs?SERVICE=WFS",
     },
+
+    # ---------------------------------------------------------------------
+    # Deutschland (Länder) – DOP20 (WMS)
+    # ---------------------------------------------------------------------
+    "dop20_bw_wms": {
+        "label": "DOP20 Baden-Württemberg (WMS)",
+        "kind": "wms",
+        "url": "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ATKIS_DOP_20_C?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_by_wms": {
+        "label": "DOP20 Bayern (WMS)",
+        "kind": "wms",
+        "url": "https://geoservices.bayern.de/od/wms/dop/v1/dop20?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_be_wms": {
+        "label": "DOP20 Berlin (WMS)",
+        "kind": "wms",
+        "url": "https://gdi.berlin.de/services/wms/dop_2025_fruehjahr?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_bb_wms": {
+        "label": "DOP20 Brandenburg (WMS)",
+        "kind": "wms",
+        "url": "https://isk.geobasis-bb.de/mapproxy/dop20c/service/wms?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_hb_wms": {
+        "label": "DOP20 Bremen (WMS)",
+        "kind": "wms",
+        "url": "https://geodienste.bremen.de/wms_dop_lb?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_hh_wms": {
+        "label": "DOP20 Hamburg (WMS)",
+        "kind": "wms",
+        "url": "https://geodienste.hamburg.de/HH_WMS_DOP?SERVICE=WMS&REQUEST=GetCapabilities",
+    },
+    "dop20_he_wms": {
+        "label": "DOP20 Hessen (WMS)",
+        "kind": "wms",
+        "url": "https://www.geoportal.hessen.de/mapbender/php/wms.php?inspire=1&layer_id=54936&withChilds=1&REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_mv_wms": {
+        "label": "DOP20 Mecklenburg-Vorpommern (WMS)",
+        "kind": "wms",
+        "url": "https://www.geodaten-mv.de/dienste/adv_dop?SERVICE=WMS&REQUEST=GetCapabilities",
+    },
+    "dop20_ni_wms": {
+        "label": "DOP20 Niedersachsen (WMS)",
+        "kind": "wms",
+        "url": "https://opendata.lgln.niedersachsen.de/doorman/noauth/dop_wms?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_nw_wms": {
+        "label": "DOP20 Nordrhein-Westfalen (WMS)",
+        "kind": "wms",
+        "url": "https://www.wms.nrw.de/geobasis/wms_nw_dop?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_rp_wms": {
+        "label": "DOP20 Rheinland-Pfalz (WMS)",
+        "kind": "wms",
+        "url": "https://www.geoportal.rlp.de/mapbender/php/wms.php?inspire=1&layer_id=61676&withChilds=1&REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_sl_wms": {
+        "label": "DOP20 Saarland (WMS)",
+        "kind": "wms",
+        "url": "https://geoportal.saarland.de/mapbender/php/wms.php?inspire=1&layer_id=46747&withChilds=1&REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_sn_wms": {
+        "label": "DOP20 Sachsen (WMS)",
+        "kind": "wms",
+        "url": "https://geodienste.sachsen.de/wms_geosn_dop-rgb/guest?REQUEST=GetCapabilities&SERVICE=WMS",
+    },
+    "dop20_st_wms": {
+        "label": "DOP20 Sachsen-Anhalt (WMS)",
+        "kind": "wms",
+        "url": "https://www.geodatenportal.sachsen-anhalt.de/wss/service/ST_LVermGeo_GDI_DOP20/guest?SERVICE=WMS&REQUEST=GetCapabilities",
+    },
+    "dop20_sh_wms": {
+        "label": "DOP20 Schleswig-Holstein (WMS)",
+        "kind": "wms",
+        "url": "https://service.gdi-sh.de/WMS_SH_MD_DOP?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0",
+    },
+    "dop20_th_wms": {
+        "label": "DOP20 Thüringen (WMS)",
+        "kind": "wms",
+        "url": "https://www.geoproxy.geoportal-th.de/geoproxy/services/DOP?SERVICE=WMS&REQUEST=GetCapabilities",
+    },
 }
 
 # ------------------------------------------------------------
@@ -619,6 +703,8 @@ def _group_for_service_key(key: str, svc: dict) -> str:
         return "Deutschland (Pegelonline)"
     if k.startswith(("bkg_", "bfn_", "bgr_", "uba_", "thuenen_")):
         return "Deutschland (Bund)"
+    if k.startswith("dop20_"):
+        return "Deutschland (Länder) – DOP20"
     if k.startswith(("dlr_", "eumetsat_")):
         return "Forschung / EO"
     if k.startswith(("eea_", "copernicus_", "emodnet_")):
@@ -637,7 +723,7 @@ def _services_grouped() -> list[tuple[str, list[tuple[str, dict]]]]:
     for g in groups:
         groups[g].sort(key=lambda kv: (kv[1].get("label", ""), kv[0]))
 
-    order = ["DWD", "DWD (CDC)", "Deutschland (Pegelonline)", "Deutschland (Bund)", "Forschung / EO", "Europa", "Niederlande (Haleconnect)", "Weitere"]
+    order = ["DWD", "DWD (CDC)", "Deutschland (Pegelonline)", "Deutschland (Bund)", "Deutschland (Länder) – DOP20", "Forschung / EO", "Europa", "Niederlande (Haleconnect)", "Weitere"]
     out: list[tuple[str, list[tuple[str, dict]]]] = []
     for g in order:
         if g in groups:
