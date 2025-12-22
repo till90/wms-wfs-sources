@@ -134,6 +134,17 @@ OGC_SERVICES = {
         "url": "https://sgx.geodatenzentrum.de/wms_dlm250_inspire?SERVICE=WMS",
     },
 
+    "wmts_dop": {
+        "label": "GeoBasis-DE / BKG WMTS DOP",
+        "kind": "wms",
+        "url": "https://sg.geodatenzentrum.de/wmts_dop?request=GetCapabilities&service=WMTS"
+    },
+    "wms_dop": {
+        "label": "GeoBasis-DE / BKG WMS DOP",
+        "kind": "wms",
+        "url": "https://sg.geodatenzentrum.de/wms_dop?request=GetCapabilities&service=WMS"
+    },
+
     # ---------------------------------------------------------------------
     # Deutschland (Bund) – BfN Schutzgebiete (Protected Sites)
     # ---------------------------------------------------------------------
