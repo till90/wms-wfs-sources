@@ -367,7 +367,7 @@ OGC_SERVICES = {
     "dop20_he_wcs": {
         "label": "DOP20 Hessen (WCS)",
         "kind": "wcs",
-        "url": "https://www.geoportal.hessen.de/mapbender/php/wms.php?inspire=1&layer_id=54451&withChilds=1&REQUEST=GetCapabilities&SERVICE=WMS",
+        "url": "https://inspire-hessen.de/raster/dop20/ows?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCapabilities",
     },
     "dop20_mv_wcs": {
         "label": "DOP20 Mecklenburg-Vorpommern (WCS)",
