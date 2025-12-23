@@ -39,22 +39,32 @@ OGC_SERVICES = {
     "dwd_wfs": {
         "label": "DWD GeoServer (WFS)",
         "kind": "wfs",
-        "url": "https://maps.dwd.de/geoserver/wfs?SERVICE=WFS",
+        "url": "https://maps.dwd.de/geoserver/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetCapabilities",
     },
     "dwd_wms": {
         "label": "DWD GeoServer (WMS)",
         "kind": "wms",
-        "url": "https://maps.dwd.de/geoserver/wms?SERVICE=WMS",
+        "url": "https://maps.dwd.de/geoserver/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetCapabilities",
     },
     "cdc_wfs": {
         "label": "DWD CDC GeoServer (WFS)",
         "kind": "wfs",
-        "url": "https://cdc.dwd.de/geoserver/ows?service=WFS",
+        "url": "https://cdc.dwd.de/geoserver/ows?service=WFS&version=2.0.0&request=GetCapabilities",
     },
     "cdc_wms": {
         "label": "DWD CDC GeoServer (WMS)",
         "kind": "wms",
-        "url": "https://cdc.dwd.de/geoserver/ows?service=WMS",
+        "url": "https://cdc.dwd.de/geoserver/ows?service=WMS&version=1.3.0&request=GetCapabilities",
+    },
+    "dwd_warnungen_wms": {
+        "label": "DWD Warnungen (WMS)",
+        "kind": "wms",
+        "url": "https://maps.dwd.de/geoproxy_warnungen/service?service=wms&version=1.3.0&request=GetCapabilities",
+    },
+    "dwd_geoproxy_wms": {
+        "label": "DWD Geoproxy (WMS)",
+        "kind": "wms",
+        "url": "https://maps.dwd.de/geoproxy/service?service=wms&version=1.3.0&request=GetCapabilities",
     },
     "pegel_wfs": {
         "label": "Pegelonline (WFS)",
