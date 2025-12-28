@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+API:
+- GET /healthz                      -> Überprüft den Zustand des Dienstes
+- GET /api?service=<service_key>&refresh=<0|1> -> Ruft die Capabilities eines OGC-Dienstes ab
+"""
 
 import os
 import time
