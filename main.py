@@ -208,7 +208,7 @@ OGC_SERVICES = {
     "bgr_buek1000_wms": {
         "label": "BGR – Boden (BUEK1000) (WMS)",
         "kind": "wms",
-        "url": "https://services.bgr.de/wms/boden/buek1000en/?SERVICE=WMS",
+        "url": "https://services.bgr.de/wms/boden/buek1000de/?SERVICE=WMS",
     },
 
     # ---------------------------------------------------------------------
